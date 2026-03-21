@@ -32,12 +32,27 @@ _PCM_FORMAT = AudioFormat(
     bit_depth=32,
     channels=2,
 )
-_SENDSPIN_PCM_FORMAT = SendspinAudioFormat(
-    sample_rate=48000,
-    bit_depth=32,
-    channels=2,
-    sample_type="float",
-)
+
+
+def _create_sendspin_pcm_format() -> SendspinAudioFormat:
+    """Create a Sendspin PCM format compatible with old and new aiosendspin APIs."""
+
+    try:
+        return SendspinAudioFormat(
+            sample_rate=48000,
+            bit_depth=32,
+            channels=2,
+            sample_type="float",
+        )
+    except TypeError:
+        return SendspinAudioFormat(
+            sample_rate=48000,
+            bit_depth=32,
+            channels=2,
+        )
+
+
+_SENDSPIN_PCM_FORMAT = _create_sendspin_pcm_format()
 # Max PCM slice fed to the producer per iteration.
 _PRODUCER_SLICE_US = 100_000
 # Max pending chunks between producer and committer before the producer blocks.
