@@ -17,6 +17,7 @@ dependencies = [
   "aiohttp==3.13.3",
   "aiohttp-fast-zlib==0.3.0",
   "aiofiles==24.1.0",
+  "aiosendspin @ git+https://github.com/rudyberends/aiosendspin.git@96a6b505c6c474445e92c74e1320d522ccaef173",
   "aiosqlite==0.22.1",
   "awesomeversion>=24.6.0",
   "certifi==2025.11.12",
