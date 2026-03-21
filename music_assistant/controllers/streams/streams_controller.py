@@ -25,6 +25,7 @@ from music_assistant_models.enums import (
     ContentType,
     MediaType,
     PlayerFeature,
+    ProviderFeature,
     StreamType,
     VolumeNormalizationMode,
 )
@@ -821,15 +822,27 @@ class StreamsController(CoreController):
         """Stream PluginSource audio to a player."""
         self._log_request(request)
         plugin_source_id = request.match_info["plugin_source"]
-        provider = cast("PluginProvider", self.mass.get_provider(plugin_source_id))
-        if not provider:
+        provider = cast("PluginProvider | None", self.mass.get_provider(plugin_source_id))
+        plugin_source = None
+        if provider:
+            plugin_source = provider.get_source_by_id(plugin_source_id)
+        if provider is None or plugin_source is None:
+            provider = None
+            for plugin_prov in self.mass.providers:
+                if not isinstance(plugin_prov, PluginProvider):
+                    continue
+                if ProviderFeature.AUDIO_SOURCE not in plugin_prov.supported_features:
+                    continue
+                if plugin_source := plugin_prov.get_source_by_id(plugin_source_id):
+                    provider = plugin_prov
+                    break
+        if provider is None or plugin_source is None:
             raise ProviderUnavailableError(f"Unknown PluginSource: {plugin_source_id}")
         # work out output format/details
         player_id = request.match_info["player_id"]
         player = self.mass.players.get_player(player_id)
         if not player:
             raise web.HTTPNotFound(reason=f"Unknown Player: {player_id}")
-        plugin_source = provider.get_source()
         output_format = await self.get_output_format(
             output_format_str=request.match_info["fmt"],
             player=player,
@@ -1382,11 +1395,23 @@ class StreamsController(CoreController):
         player_filter_params: list[str] | None = None,
     ) -> AsyncGenerator[bytes, None]:
         """Get the special plugin source stream."""
-        plugin_prov = cast("PluginProvider", self.mass.get_provider(plugin_source_id))
-        if not plugin_prov:
+        plugin_prov = cast("PluginProvider | None", self.mass.get_provider(plugin_source_id))
+        plugin_source = None
+        if plugin_prov:
+            plugin_source = plugin_prov.get_source_by_id(plugin_source_id)
+        if plugin_prov is None or plugin_source is None:
+            plugin_prov = None
+            for provider in self.mass.providers:
+                if not isinstance(provider, PluginProvider):
+                    continue
+                if ProviderFeature.AUDIO_SOURCE not in provider.supported_features:
+                    continue
+                if plugin_source := provider.get_source_by_id(plugin_source_id):
+                    plugin_prov = provider
+                    break
+        if plugin_prov is None or plugin_source is None:
             raise ProviderUnavailableError(f"Unknown PluginSource: {plugin_source_id}")
 
-        plugin_source = plugin_prov.get_source()
         self.logger.debug(
             "Start streaming PluginSource %s to %s using output format %s",
             plugin_source_id,
@@ -1400,7 +1425,7 @@ class StreamsController(CoreController):
             async for chunk in get_ffmpeg_stream(
                 audio_input=cast(
                     "str | AsyncGenerator[bytes, None]",
-                    plugin_prov.get_audio_stream(player_id)
+                    plugin_prov.get_audio_stream_for_source(plugin_source_id, player_id)
                     if plugin_source.stream_type == StreamType.CUSTOM
                     else plugin_source.path,
                 ),

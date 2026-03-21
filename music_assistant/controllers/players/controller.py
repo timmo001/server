@@ -393,12 +393,14 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
     @api_command("players/plugin_sources")
     def get_plugin_sources(self) -> list[PluginSource]:
         """Return all available plugin sources."""
-        return [
-            plugin_prov.get_source()
-            for plugin_prov in self.mass.get_providers(ProviderType.PLUGIN)
-            if isinstance(plugin_prov, PluginProvider)
-            and ProviderFeature.AUDIO_SOURCE in plugin_prov.supported_features
-        ]
+        sources: list[PluginSource] = []
+        for plugin_prov in self.mass.providers:
+            if not isinstance(plugin_prov, PluginProvider):
+                continue
+            if ProviderFeature.AUDIO_SOURCE not in plugin_prov.supported_features:
+                continue
+            sources.extend(plugin_prov.get_sources())
+        return sources
 
     @api_command("players/plugin_source")
     def get_plugin_source(
@@ -411,11 +413,12 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
         :param source_id: ID of the plugin source.
         :return: PluginSource object or None.
         """
-        for plugin_prov in self.mass.get_providers(ProviderType.PLUGIN):
-            assert isinstance(plugin_prov, PluginProvider)  # for type checking
+        for plugin_prov in self.mass.providers:
+            if not isinstance(plugin_prov, PluginProvider):
+                continue
             if ProviderFeature.AUDIO_SOURCE not in plugin_prov.supported_features:
                 continue
-            if (source := plugin_prov.get_source()) and source.id == source_id:
+            if source := plugin_prov.get_source_by_id(source_id):
                 return source
         return None
 
@@ -2209,10 +2212,16 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             await asyncio.sleep(1)
 
     async def _handle_select_plugin_source(
-        self, player: Player, plugin_prov: PluginProvider
+        self, player: Player, plugin_prov: PluginProvider, source_id: str | None = None
     ) -> None:
         """Handle playback/select of given plugin source on player."""
-        plugin_source = plugin_prov.get_source()
+        plugin_source = (
+            plugin_prov.get_source_by_id(source_id) if source_id else plugin_prov.get_source()
+        )
+        if plugin_source is None:
+            raise PlayerCommandFailed(
+                f"Unknown plugin source {source_id} for provider {plugin_prov.name}"
+            )
         if plugin_source.in_use_by and plugin_source.in_use_by != player.player_id:
             self.logger.debug(
                 "Plugin source %s is already in use by player %s, stopping playback there first.",
@@ -2977,6 +2986,15 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             player.set_active_mass_source(source)
             await self._handle_select_plugin_source(player, cast("PluginProvider", plugin_prov))
             return
+        for plugin_prov in self.mass.providers:
+            if not isinstance(plugin_prov, PluginProvider):
+                continue
+            if ProviderFeature.AUDIO_SOURCE not in plugin_prov.supported_features:
+                continue
+            if plugin_prov.get_source_by_id(source):
+                player.set_active_mass_source(source)
+                await self._handle_select_plugin_source(player, plugin_prov, source)
+                return
         # check if source is a mass queue
         # this can be used to restore the queue after a source switch
         if self.mass.player_queues.get(source):

@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import logging
+from collections.abc import AsyncGenerator, Callable
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any, cast
+from weakref import WeakKeyDictionary
 
 from aiosendspin.server import ClientAddedEvent, ClientRemovedEvent, SendspinEvent, SendspinServer
-from music_assistant_models.enums import IdentifierType, PlayerType, ProviderFeature
+from aiosendspin.server.audio import AudioFormat as SendspinAudioFormat
+from aiosendspin.server.channels import MAIN_CHANNEL
+from aiosendspin.server.roles.source.group import SourceDecoder, SourceGroupRole
+from aiosendspin.server.roles.source.v1 import SourceV1Role
+from music_assistant_models.enums import ContentType, IdentifierType, PlayerType, ProviderFeature
 from music_assistant_models.errors import AlreadyRegisteredError
+from music_assistant_models.media_items.audio_format import AudioFormat
+from music_assistant_models.streamdetails import StreamMetadata
 
 from music_assistant.constants import CONF_ENABLED
 from music_assistant.mass import MusicAssistant
 from music_assistant.models.player_provider import PlayerProvider
+from music_assistant.models.plugin import PluginProvider, PluginSource
 from music_assistant.providers.sendspin.player import SendspinPlayer
 
 ClientUpdatedEvent = cast(
@@ -24,6 +34,91 @@ ClientUpdatedEvent = cast(
     ),
 )
 
+SourceListener = Callable[[SourceV1Role, int, bytes], None]
+_SOURCE_LISTENERS: WeakKeyDictionary[SourceGroupRole, list[SourceListener]] = WeakKeyDictionary()
+_SOURCE_GROUP_ROLE_PATCHED = [False]
+
+
+def _add_source_listener(
+    group_role: SourceGroupRole, callback: SourceListener
+) -> Callable[[], None]:
+    """Register a temporary PCM listener for a Sendspin source group."""
+    listeners = _SOURCE_LISTENERS.setdefault(group_role, [])
+    listeners.append(callback)
+
+    def _remove() -> None:
+        with suppress(ValueError):
+            listeners.remove(callback)
+        if not listeners:
+            _SOURCE_LISTENERS.pop(group_role, None)
+
+    return _remove
+
+
+def _ensure_source_listener_support() -> None:
+    """Patch SourceGroupRole with listener hooks for decoded PCM source audio."""
+    if _SOURCE_GROUP_ROLE_PATCHED[0]:
+        return
+
+    async def _ingest_one(self: SourceGroupRole, ingress: Any) -> None:
+        role = ingress.role
+        stream_format = role.input_stream_format
+        if stream_format is None:
+            return
+        audio_format = SendspinAudioFormat(
+            sample_rate=stream_format.sample_rate,
+            bit_depth=stream_format.bit_depth,
+            channels=stream_format.channels,
+        )
+        chunks: list[bytes]
+        if stream_format.codec.value == "pcm":
+            chunks = [ingress.data]
+        else:
+            decoder = self._source_decoders.get(role._client.client_id)
+            if decoder is None:
+                decoder = SourceDecoder(
+                    codec=stream_format.codec,
+                    sample_rate=stream_format.sample_rate,
+                    channels=stream_format.channels,
+                    bit_depth=stream_format.bit_depth,
+                    codec_header_b64=stream_format.codec_header,
+                )
+                self._source_decoders[role._client.client_id] = decoder
+            chunks = decoder.decode(ingress.data)
+            if not chunks:
+                return
+
+        stream = self._group._push_stream
+        if stream is None or stream.is_stopped:
+            stream = self._group.start_stream()
+        if self._active_source_id != role._client.client_id:
+            self._active_source_id = role._client.client_id
+            self.push_state()
+
+        listeners = list(_SOURCE_LISTENERS.get(self, ()))
+        bytes_per_sample = stream_format.bit_depth // 8
+        play_start_us = ingress.timestamp_us
+        for chunk in chunks:
+            for listener in listeners:
+                try:
+                    listener(role, play_start_us, chunk)
+                except Exception:
+                    LOGGER.exception("Sendspin source listener failed")
+            stream.prepare_audio(chunk, audio_format, channel_id=MAIN_CHANNEL)
+            await stream.commit_audio(play_start_us=play_start_us)
+            if bytes_per_sample > 0:
+                frame_count = len(chunk) // (stream_format.channels * bytes_per_sample)
+                if frame_count > 0:
+                    play_start_us += round((frame_count * 1_000_000) / stream_format.sample_rate)
+
+    SourceGroupRole._ingest_one = _ingest_one  # type: ignore[method-assign]
+    _SOURCE_GROUP_ROLE_PATCHED[0] = True
+
+
+_ensure_source_listener_support()
+
+LOGGER = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.provider import ProviderManifest
@@ -31,7 +126,7 @@ if TYPE_CHECKING:
     from music_assistant.providers.hass import HomeAssistantProvider
 
 
-class SendspinProvider(PlayerProvider):
+class SendspinProvider(PlayerProvider, PluginProvider):
     """Player Provider for Sendspin."""
 
     server_api: SendspinServer
@@ -40,6 +135,7 @@ class SendspinProvider(PlayerProvider):
     _bridge_identifiers: dict[str, dict[IdentifierType, str]]
     _client_event_versions: dict[str, int]
     _client_event_task_counts: dict[str, int]
+    _source_in_use_by: dict[str, str | None]
     _unloading: bool
 
     def __init__(
@@ -54,10 +150,109 @@ class SendspinProvider(PlayerProvider):
         self._bridge_identifiers = {}
         self._client_event_versions = {}
         self._client_event_task_counts = {}
+        self._source_in_use_by = {}
         self._unloading = False
         self.unregister_cbs = [
             self.server_api.add_event_listener(self.event_cb),
         ]
+
+    def get_source_by_id(self, source_id: str) -> PluginSource | None:
+        """Return a plugin-style source wrapper for a connected Sendspin source client."""
+        sendspin_client = self.server_api.get_client(source_id)
+        if sendspin_client is None:
+            return None
+        roles = sendspin_client.roles_by_family("source")
+        if not roles:
+            return None
+        source_role = next((role for role in roles if isinstance(role, SourceV1Role)), None)
+        if source_role is None:
+            return None
+        stream_format = source_role.input_stream_format
+        bit_depth = stream_format.bit_depth if stream_format else 16
+        sample_rate = stream_format.sample_rate if stream_format else 44100
+        channels = stream_format.channels if stream_format else 2
+        content_type = ContentType.try_parse(f"pcm_s{bit_depth}le")
+        if content_type == ContentType.UNKNOWN:
+            content_type = ContentType.PCM_S16LE
+            bit_depth = 16
+        return PluginSource(
+            id=source_id,
+            name=sendspin_client.name,
+            passive=False,
+            can_play_pause=False,
+            can_seek=False,
+            can_next_previous=False,
+            audio_format=AudioFormat(
+                content_type=content_type,
+                codec_type=content_type,
+                sample_rate=sample_rate,
+                bit_depth=bit_depth,
+                channels=channels,
+            ),
+            metadata=StreamMetadata(title=sendspin_client.name),
+            in_use_by=self._source_in_use_by.get(source_id),
+        )
+
+    def get_sources(self) -> list[PluginSource]:
+        """Return plugin-style source wrappers for all connected Sendspin sources."""
+        sources: list[PluginSource] = []
+        for client in self.server_api.clients:
+            if source := self.get_source_by_id(client.client_id):
+                sources.append(source)
+        return sources
+
+    async def get_audio_stream_for_source(
+        self, source_id: str, player_id: str
+    ) -> AsyncGenerator[bytes, None]:
+        """Return an audio stream from the selected Sendspin source client."""
+        sendspin_client = self.server_api.get_client(source_id)
+        if sendspin_client is None:
+            return
+        group_role = sendspin_client.group.group_role("source")
+        if not isinstance(group_role, SourceGroupRole):
+            return
+        self._source_in_use_by[source_id] = player_id
+        source_role = next(
+            (
+                role
+                for role in sendspin_client.roles_by_family("source")
+                if isinstance(role, SourceV1Role)
+            ),
+            None,
+        )
+        if source_role is not None:
+            source_role.send_start_command()
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=256)
+
+        def on_chunk(role: SourceV1Role, _timestamp_us: int, data: bytes) -> None:
+            if role._client.client_id != source_id:
+                return
+            try:
+                queue.put_nowait(data)
+            except asyncio.QueueFull:
+                self.logger.warning("Dropping Sendspin source audio for %s: queue full", source_id)
+
+        unsubscribe: Callable[[], None] | None = None
+        try:
+            unsubscribe = _add_source_listener(group_role, on_chunk)
+            while self._source_in_use_by.get(source_id) == player_id:
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=1)
+                except TimeoutError:
+                    if self.server_api.get_client(source_id) is None:
+                        break
+                    continue
+                if chunk is None:
+                    break
+                yield chunk
+        finally:
+            if unsubscribe is not None:
+                unsubscribe()
+            if source_role is not None:
+                with suppress(Exception):
+                    source_role.send_stop_command()
+            if self._source_in_use_by.get(source_id) == player_id:
+                self._source_in_use_by[source_id] = None
 
     def _begin_client_event(self, client_id: str) -> int:
         """Increment version and in-flight task count for a client event."""
@@ -207,6 +402,7 @@ class SendspinProvider(PlayerProvider):
             if self._unloading:
                 return
             self.logger.debug("Client %s disconnected", client_id)
+            self._source_in_use_by.pop(client_id, None)
             if not self._is_current_client_event(client_id, event_version):
                 self.logger.debug("Skipping stale remove event for %s", client_id)
                 return
@@ -258,6 +454,7 @@ class SendspinProvider(PlayerProvider):
     def supported_features(self) -> set[ProviderFeature]:
         """Return the features supported by this Provider."""
         return {
+            ProviderFeature.AUDIO_SOURCE,
             ProviderFeature.SYNC_PLAYERS,
         }
 
@@ -307,6 +504,7 @@ class SendspinProvider(PlayerProvider):
         self.unregister_cbs = []
         self._client_event_task_counts.clear()
         self._client_event_versions.clear()
+        self._source_in_use_by.clear()
         await asyncio.gather(
             *(
                 self.mass.players.unregister(player_id, permanent=is_removed)

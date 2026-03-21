@@ -161,6 +161,17 @@ class PluginProvider(Provider):
         """
         raise NotImplementedError
 
+    def get_sources(self) -> list[PluginSource]:
+        """Return all (audio)sources exposed by this provider."""
+        return [self.get_source()]
+
+    def get_source_by_id(self, source_id: str) -> PluginSource | None:
+        """Return a specific (audio)source by its source ID."""
+        for source in self.get_sources():
+            if source.id == source_id:
+                return source
+        return None
+
     async def get_audio_stream(self, player_id: str) -> AsyncGenerator[bytes, None]:
         """
         Return the (custom) audio stream for the audio source provided by this plugin.
@@ -174,6 +185,13 @@ class PluginProvider(Provider):
         """
         yield b""
         raise NotImplementedError
+
+    async def get_audio_stream_for_source(
+        self, source_id: str, player_id: str
+    ) -> AsyncGenerator[bytes, None]:
+        """Return the audio stream for a specific source provided by this plugin."""
+        async for chunk in self.get_audio_stream(player_id):
+            yield chunk
 
     async def resolve_image(self, path: str) -> str | bytes:
         """
