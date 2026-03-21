@@ -6,13 +6,12 @@ import asyncio
 from collections.abc import Callable
 from typing import TYPE_CHECKING, cast
 
-from aiosendspin.server import (
-    ClientAddedEvent,
-    ClientRemovedEvent,
-    ClientUpdatedEvent,
-    SendspinEvent,
-    SendspinServer,
-)
+from aiosendspin.server import ClientAddedEvent, ClientRemovedEvent, SendspinEvent, SendspinServer
+
+try:
+    from aiosendspin.server import ClientUpdatedEvent
+except ImportError:  # pragma: no cover - compatibility with older source-role branch
+    ClientUpdatedEvent = None
 from music_assistant_models.enums import IdentifierType, PlayerType, ProviderFeature
 from music_assistant_models.errors import AlreadyRegisteredError
 
@@ -87,7 +86,8 @@ class SendspinProvider(PlayerProvider):
             case ClientRemovedEvent(client_id):
                 event_version = self._begin_client_event(client_id)
                 self.mass.create_task(self._handle_client_removed(client_id, event_version))
-            case ClientUpdatedEvent(client_id):
+            case _ if ClientUpdatedEvent is not None and isinstance(event, ClientUpdatedEvent):
+                client_id = event.client_id
                 event_version = self._begin_client_event(client_id)
                 self.mass.create_task(self._handle_client_updated(client_id, event_version))
             case _:
