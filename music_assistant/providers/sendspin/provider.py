@@ -4,14 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from aiosendspin.server import ClientAddedEvent, ClientRemovedEvent, SendspinEvent, SendspinServer
-
-try:
-    from aiosendspin.server import ClientUpdatedEvent
-except ImportError:  # pragma: no cover - compatibility with older source-role branch
-    ClientUpdatedEvent = None
 from music_assistant_models.enums import IdentifierType, PlayerType, ProviderFeature
 from music_assistant_models.errors import AlreadyRegisteredError
 
@@ -19,6 +14,15 @@ from music_assistant.constants import CONF_ENABLED
 from music_assistant.mass import MusicAssistant
 from music_assistant.models.player_provider import PlayerProvider
 from music_assistant.providers.sendspin.player import SendspinPlayer
+
+ClientUpdatedEvent = cast(
+    "type[Any] | None",
+    getattr(
+        __import__("aiosendspin.server", fromlist=["ClientUpdatedEvent"]),
+        "ClientUpdatedEvent",
+        None,
+    ),
+)
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig

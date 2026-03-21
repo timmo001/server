@@ -521,7 +521,24 @@ class SendspinPlayer(Player):
         )
         if config_value == SENDSPIN_FORMAT_AUTOMATIC:
             # Automatic mode: clear override and let client decide.
-            player_role.set_preferred_format(None, None)
+            try:
+                player_role.set_preferred_format(
+                    cast("SendspinAudioFormat", None),
+                    cast("AudioCodec", None),
+                )
+            except (AttributeError, TypeError):
+                supported_formats = player_role.get_supported_formats()
+                if not supported_formats:
+                    return
+                preferred_supported = supported_formats[0]
+                player_role.set_preferred_format(
+                    SendspinAudioFormat(
+                        sample_rate=preferred_supported.sample_rate,
+                        bit_depth=preferred_supported.bit_depth,
+                        channels=preferred_supported.channels,
+                    ),
+                    preferred_supported.codec,
+                )
             return
 
         parsed = option_value_to_format(config_value)

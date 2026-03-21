@@ -8,11 +8,11 @@ from collections import deque
 from collections.abc import Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID, uuid4
 
 from aiosendspin.server.audio import AudioFormat as SendspinAudioFormat
-from aiosendspin.server.push_stream import MAIN_CHANNEL, PushStream
+from aiosendspin.server.channels import MAIN_CHANNEL
 from music_assistant_models.enums import ContentType
 from music_assistant_models.media_items.audio_format import AudioFormat
 
@@ -22,6 +22,8 @@ from music_assistant.helpers.ffmpeg import FFMpeg
 from music_assistant.models.player import PlayerMedia
 
 if TYPE_CHECKING:
+    from aiosendspin.server.push_stream import PushStream
+
     from .player import SendspinPlayer
 
 
@@ -36,13 +38,17 @@ _PCM_FORMAT = AudioFormat(
 
 def _create_sendspin_pcm_format() -> SendspinAudioFormat:
     """Create a Sendspin PCM format compatible with old and new aiosendspin APIs."""
+    sendspin_audio_format_cls: Any = SendspinAudioFormat
 
     try:
-        return SendspinAudioFormat(
-            sample_rate=48000,
-            bit_depth=32,
-            channels=2,
-            sample_type="float",
+        return cast(
+            "SendspinAudioFormat",
+            sendspin_audio_format_cls(
+                sample_rate=48000,
+                bit_depth=32,
+                channels=2,
+                sample_type="float",
+            ),
         )
     except TypeError:
         return SendspinAudioFormat(
